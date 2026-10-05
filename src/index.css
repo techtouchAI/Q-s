@@ -1,0 +1,53 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .font-naskh {
+    font-family: 'Noto Naskh Arabic', -apple-system, BlinkMacSystemFont, serif;
+  }
+
+  .font-amiri {
+    font-family: 'Amiri', serif;
+  }
+
+  .font-tajawal {
+    font-family: 'Tajawal', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  .font-rakkas {
+    font-family: 'Rakkas', cursive;
+  }
+
+  .font-cairo {
+    font-family: 'Cairo', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+}
+
+/* Print Styles for exact A4 paper output */
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 0;
+  }
+
+  body {
+    background: white !important;
+    color: black !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  #printable-a4-sheet {
+    box-shadow: none !important;
+    border: none !important;
+    width: 100% !important;
+    min-height: 100vh !important;
+    transform: none !important;
+    margin: 0 !important;
+  }
+
+  header,
+  nav,
+  .print\:hidden {
+    display: none !important;
+  }
+}

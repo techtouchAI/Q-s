@@ -1,0 +1,6 @@
+{
+  "name": "صانع ومحرر الأسئلة",
+  "description": "تطبيق متكامل لتصميم وتحرير أوراق الأسئلة الامتحانية مع دعم الفروع والمعادلات الرياضية والتصدير المباشر لـ PDF و Word",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

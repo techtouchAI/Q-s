@@ -1,0 +1,472 @@
+name: Build & Release Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - 'arena/**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Analyze, test, and build APK
+    # Pin the runner image to avoid unreviewed toolchain changes from ubuntu-latest.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      # Immutable action references avoid surprise changes to the CI toolchain.
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: '3.22.3'
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      # حزمة pdf في هذا المستودع نسخة معدّلة محلياً (third_party/pdf عبر
+      # dependency_overrides) تحمل إصلاحاً واحداً: مسافات الكلمات العربية في
+      # النص من اليمين إلى اليسار (_Line.realign كان يعكس بعرض الحبر بدل عرض
+      # التقدّم). هذا الفحص يفشل بوضوح إذا استُبدلت النسخة بأصل غير مُصلح.
+      - name: Verify vendored pdf patch (Arabic RTL word spacing)
+        run: dart run tool/verify_vendored_pdf_patch.dart
+
+      - name: Analyze source
+        id: analyze
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter analyze --fatal-infos 2>&1 | tee "$RUNNER_TEMP/flutter-analyze.log"
+
+      - name: Run tests
+        id: test
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter test 2>&1 | tee "$RUNNER_TEMP/flutter-test.log"
+
+      # عينات التصدير التي تكتبها الاختبارات إلى build/math_samples — docx من
+      # مُصدِّر Word وpdf من مُصدِّر PDF — تُرفع مرفقاً عندما يحمل آخر رسائل
+      # الالتزام وسم [math-samples] فقط: يفتحها إنسان في Word/Acrobat ليراجع
+      # المعادلات، ومن بلا Flutter في بيئته يحصل على الملفات من هنا. لا وسم ←
+      # لا مرفق، فلا ثقل على البناء المعتاد.
+      - name: Upload math samples (Word + PDF)
+        if: >-
+          !cancelled() &&
+          contains(github.event.head_commit.message, '[math-samples]')
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: math-samples
+          path: build/math_samples/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # بوابة P0 (test/export_gate) تكتب القطع الأربعة + المصفوفة إلى
+      # build/export_gate؛ تُرفع دائماً لأن الدليل هو غرض البوابة لا رقم
+      # الخروج: من راجع الانحدار يريد vector.pdf وeditable.docx وخريطة
+      # 15×4، لا رسالة «1 test failed».
+      - name: Upload P0 export-gate artifacts
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: p0-export-gate
+          path: build/export_gate/*
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Publish P0 export-gate matrix
+        if: always()
+        shell: bash
+        run: |
+          [ -f build/export_gate/matrix.txt ] || exit 0
+          {
+            echo '### بوابة P0 — مصفوفة الانحدار (15 ميزة × 4 ممرّات)'
+            echo ''
+            echo '```'
+            cat build/export_gate/matrix.txt
+            echo '```'
+            echo ''
+            if [ -f build/export_gate/summary.txt ]; then
+              echo '```'
+              tail -n 12 build/export_gate/summary.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # نجاحٌ بلا رقم ليس دليلاً: التعليقات هي القناة الوحيدة التي يقرأها
+          # من لا يملك سجلّات التشغيل، فتنشر الحصيلة في الجولة الخضراء كما في
+          # الحمراء (لا يُستنتج «نُجحت» من حالة الفحص وحدها).
+          if [ -f "$RUNNER_TEMP/flutter-test.log" ]; then
+            # `|| true` لازم: الخطوة تشتغل بـ `-e -o pipefail`، وgrep بلا مطابقة
+            # يخرج 1 — أي أن «صفر أخطاء» كان يُفشل نفس الخطوة التي تنشر النجاح.
+            counts="$({ grep -oE '[0-9]+ tests? passed|[0-9]+ tests? failed|All tests passed!|[0-9]+:[0-9]+ \+[0-9]+ ~?[0-9]* ?-?[0-9]*' "$RUNNER_TEMP/flutter-test.log" || true; } | tail -n 4 | tr '\n' ' ')"
+            counts="${counts//%/%25}"; counts="${counts//:/%3A}"
+            counts="${counts//$'\r'/%0D}"; counts="${counts//$'\n'/%0A}"
+            echo "::notice title=P0 gate — flutter test::$counts"
+          fi
+          if [ -f build/export_gate/matrix.txt ]; then
+            tally=""
+            for st in PASS FAIL DEFERRED_TO_P1 NOT_APPLICABLE UNMEASURED; do
+              n="$({ grep -o "\b$st\b" build/export_gate/matrix.txt || true; } | wc -l | tr -d ' ')"
+              tally="$tally$st=$n "
+            done
+            tally="${tally//%/%25}"; tally="${tally//:/%3A}"
+            echo "::notice title=P0 gate — matrix tally::$tally"
+            # الحصيلة الرقمية وحدها لا تُرين أي خلية مُؤجَّلة: الجدول كاملاً
+            # في تعليق ليُقرأ من الـ API كما من صفحة التشغيل. وترتيب الترميز
+            # مهم: `%` أولاً ثم `:` وإلا صار `%3A` نفسه مُرمَّزاً مرتين.
+            table="$(cat build/export_gate/matrix.txt)"
+            table="${table//%/%25}"; table="${table//:/%3A}"
+            table="${table//$'\n'/%0A}"
+            echo "::notice title=P0 gate — matrix (60 cells)::$table"
+          fi
+          # الأدلة الرقمية لكل خلية (أعداد الصفحات، الأسطر، الأجزاء) كانت
+          # محصورة في مرفق لا يُقرأ من كل بيئة — فتُنشر تعليقاً أيضاً،
+          # فيبقى الرقم قابلاً للتحقق من الـ API كما من صفحة التشغيل.
+          if [ -f build/export_gate/summary.txt ]; then
+            evidence="$(cat build/export_gate/summary.txt)"
+            evidence="${evidence//%/%25}"; evidence="${evidence//:/%3A}"
+            evidence="${evidence//$'\r'/%0D}"; evidence="${evidence//$'\n'/%0A}"
+            echo "::notice title=P0 gate — summary::$evidence"
+          fi
+      - name: Publish analyzer and test diagnostics
+        if: failure() && (steps.analyze.outcome == 'failure' || steps.test.outcome == 'failure')
+        shell: bash
+        run: |
+          publish_tail() {
+            local file="$1" label="$2" excerpt
+            [ -f "$file" ] || return 0
+            excerpt="$(tail -n 30 "$file")"
+            [ -n "$excerpt" ] || return 0
+            excerpt="${excerpt//%/%25}"
+            excerpt="${excerpt//$'\r'/%0D}"
+            excerpt="${excerpt//$'\n'/%0A}"
+            echo "::error title=$label::$excerpt"
+          }
+          # ينشر أسماء كل الاختبارات الفاشلة في تعليق واحد مبكّر — التغطية
+          # (cap ~50 تعليقاً) لا تقطعه، وبدونه تختفي أسماء الفشل خلف
+          # مقاطع الأدلة الطويلة.
+          publish_failure_names() {
+            local file="$1" names count
+            [ -f "$file" ] || return 0
+            names="$(grep -E 'dart: .+ \(failed\)$' "$file" \
+              | sed -E 's/.*dart: //; s/ \(failed\)$//' \
+              | sort -u)"
+            [ -n "$names" ] || return 0
+            count="$(printf '%s\n' "$names" | wc -l | tr -d ' ')"
+            names="${names//%/%25}"
+            names="${names//$'\r'/%0D}"
+            names="${names//$'\n'/%0A}"
+            echo "::error title=Failing tests ($count)::$names"
+          }
+          # ينشر سياق كل اختبار فاشل (رسالة التوقّع والفرق) في تعليق **مستقل
+          # صغير** لكل اختبار: حجم التعليق الواحد محدود (~4KB) وسقف عدد
+          # التعليقات على التشغيل محدود أيضاً، فالتجميع في تعليق ضخم كان
+          # يُبتر قبل آخر الفشولات. تُقدَّم أخطاء التشغيل على أخطاء التحميل
+          # (الترجمة)، وأسماء كل الفشولات تُنشر دائماً في تعليق مستقل قبلها.
+          publish_first_failure() {
+            local file="$1" label="$2" markers line start entry count=0
+            [ -f "$file" ] || return 0
+            markers="$( { grep -n -E '❌.*\(failed\)' "$file" | grep -v 'loading ' || true; \
+                         grep -n -E '❌ loading ' "$file" || true; } | cut -d: -f1 | head -n 8 )"
+            while read -r line; do
+              [ -n "$line" ] || continue
+              start=$((line > 2 ? line - 2 : 1))
+              entry="$(sed -n "${start},$((start + 34))p" "$file")"
+              [ -n "$entry" ] || continue
+              count=$((count + 1))
+              entry="${entry:0:2300}"
+              entry="${entry//%/%25}"
+              entry="${entry//$'\r'/%0D}"
+              entry="${entry//$'\n'/%0A}"
+              echo "::error title=$label ($count)::$entry"
+            done <<< "$markers"
+            if [ "$count" -eq 0 ]; then
+              # لا علامة فشل ظاهرة في السجل: ننشر آخر 140 سطراً كاملة.
+              entry="$(tail -n 140 "$file")"
+              [ -n "$entry" ] || return 0
+              entry="${entry//%/%25}"
+              entry="${entry//$'\r'/%0D}"
+              entry="${entry//$'\n'/%0A}"
+              echo "::error title=$label::$entry"
+            fi
+          }
+          # المحلل قد يُنتج عشرات الأخطاء فلا يكفي ذيل السجل: ننشر **كل**
+          # أخطاء المحلل (منزوعة التكرار) ثم ملخّص التحذيرات/الملاحظات،
+          # فيظهر سبب الفشل كاملاً من التشغيل نفسه بلا حاجة لتنزيل السجلات.
+          publish_analyzer_findings() {
+            local file="$1" level="$2" label="$3" limit="$4" lines count
+            [ -f "$file" ] || return 0
+            lines="$(grep -E "(^|[[:space:]])$level • " "$file" | sort -u | head -n "$limit" || true)"
+            [ -n "$lines" ] || return 0
+            count="$(printf '%s\n' "$lines" | wc -l | tr -d ' ')"
+            lines="${lines//%/%25}"
+            lines="${lines//$'\r'/%0D}"
+            lines="${lines//$'\n'/%0A}"
+            echo "::error title=$label ($count)::$lines"
+          }
+          # أخطاء مترجم Dart تُطبع **قبل** «Failed to load» فتبقى خارج نوافذ
+          # مقاطع الفشل: بدونها يصير فشل تحميل الاختبار بلا سبب مسمّى.
+          publish_compile_errors() {
+            local file="$1" lines count
+            [ -f "$file" ] || return 0
+            lines="$(grep -E '\.dart:[0-9]+:[0-9]+: (Error|Warning):' "$file" \
+              | sed -E 's|/home/runner/work/[^ ]*/||' | sort -u | head -n 30 || true)"
+            [ -n "$lines" ] || return 0
+            count="$(printf '%s\n' "$lines" | wc -l | tr -d ' ')"
+            lines="${lines//%/%25}"
+            lines="${lines//$'\r'/%0D}"
+            lines="${lines//$'\n'/%0A}"
+            echo "::error title=Dart compiler errors ($count)::$lines"
+          }
+          # ملاحظات `warning`/`info` تُفشل الخطوة بـ`--fatal-infos` أيضاً، لكن
+          # النشر كان يقتصر على `error` فيصل الفشل بلا رقم ولا قاعدة. هنا
+          # تُنشر القاعدتان (كل واحدة بحد 60 سطراً) مع حصيلة لكل قاعدة.
+          publish_analyzer_tally() {
+            local file="$1" tally total
+            [ -f "$file" ] || return 0
+            total="$(grep -cE '^[[:space:]]+(error|warning|info) • ' "$file" || true)"
+            [ -n "$total" ] && [ "$total" -gt 0 ] || return 0
+            tally="$({ grep -oE '• [a-z_]+$' "$file" || true; } \
+              | sort | uniq -c | sort -rn | tr -s ' ' | tr '\n' ';' || true)"
+            tally="${tally//%/%25}"
+            echo "::notice title=Analyzer findings tally (total=$total)::$tally"
+          }
+          publish_analyzer_findings "$RUNNER_TEMP/flutter-analyze.log" 'error' 'Analyzer errors' 80
+          publish_analyzer_findings "$RUNNER_TEMP/flutter-analyze.log" 'warning' 'Analyzer warnings' 60
+          publish_analyzer_findings "$RUNNER_TEMP/flutter-analyze.log" 'info' 'Analyzer infos' 60
+          publish_analyzer_tally "$RUNNER_TEMP/flutter-analyze.log"
+          publish_compile_errors "$RUNNER_TEMP/flutter-test.log"
+          publish_gate_stages() {
+            local file="$1" lines count
+            [ -f "$file" ] || return 0
+            lines="$(grep -F '[p0-gate]' "$file" | tail -n 24 || true)"
+            [ -n "$lines" ] || return 0
+            count="$(printf '%s\n' "$lines" | wc -l | tr -d ' ')"
+            lines="${lines//%/%25}"
+            lines="${lines//$'\r'/%0D}"
+            lines="${lines//$'\n'/%0A}"
+            echo "::error title=P0 gate stages ($count)::$lines"
+          }
+          publish_gate_stages "$RUNNER_TEMP/flutter-test.log"
+          # سبب فشل واحد لكل اختبار بوابة: نافذة «مقطع الفشل» المشتركة تُقتطع
+          # عند حد GitHub، فتنحصر القراءة في أول اختبار فقط. الحل: تعليق مستقل
+          # لكل P0-GATE-NN يحمل أول أسطر بعده حتى السبب (reason).
+          publish_gate_reasons() {
+            local file="$1" id block
+            [ -f "$file" ] || return 0
+            for id in 00 01 01B 02 03 04 05 06 07 08 09 10 11 99; do
+              block="$(awk -v pat="P0-GATE-$id:" '
+                index($0, pat) > 0 && index($0, "❌") > 0 && index($0, "(failed)") > 0 {
+                  show = 9; next
+                }
+                index($0, "::endgroup::") > 0 { if (show > 0) { show = 0 }; next }
+                index($0, "❌") > 0 || index($0, "✅") > 0 { next }
+                show > 0 { print "  " substr($0, 1, 200); show-- }
+              ' "$file" | head -n 9)"
+              [ -n "$block" ] || continue
+              block="${block//%/%25}"
+              block="${block//$'\r'/%0D}"
+              block="${block//$'\n'/%0A}"
+              echo "::error title=P0-GATE-$id reason::$block"
+            done
+          }
+          publish_gate_reasons "$RUNNER_TEMP/flutter-test.log"
+          publish_failure_names "$RUNNER_TEMP/flutter-test.log"
+          publish_tail "$RUNNER_TEMP/flutter-analyze.log" 'Flutter analyzer log excerpt'
+          publish_tail "$RUNNER_TEMP/flutter-test.log" 'Flutter test log excerpt'
+          publish_first_failure "$RUNNER_TEMP/flutter-test.log" 'Failing test excerpts'
+
+      - name: Upload validation diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flutter-validation-diagnostics
+          path: |
+            ${{ runner.temp }}/flutter-analyze.log
+            ${{ runner.temp }}/flutter-test.log
+            ${{ runner.temp }}/flutter-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Build release APK
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter build apk --release 2>&1 | tee "$RUNNER_TEMP/flutter-build.log"
+
+      # تعذّر فشل بناء APK لا يُظهره محلّل Dart ولا الاختبارات (Kotlin/Gradle)،
+      # فننشر أخطاء البناء نفسها كتعليقات على التشغيل.
+      - name: Publish build diagnostics
+        if: failure() && steps.build.outcome == 'failure'
+        shell: bash
+        run: |
+          publish_excerpt() {
+            local label="$1" excerpt="$2"
+            [ -n "$excerpt" ] || return 0
+            excerpt="${excerpt//%/%25}"
+            excerpt="${excerpt//$'\r'/%0D}"
+            excerpt="${excerpt//$'\n'/%0A}"
+            echo "::error title=$label::$excerpt"
+          }
+          file="$RUNNER_TEMP/flutter-build.log"
+          [ -f "$file" ] || exit 0
+          errors="$(grep -E '^e: |^w: |error:|FAILURE: |Execution failed for task|> Task .*FAILED|Caused by: |What went wrong|Could not (resolve|determine)|A problem occurred' "$file" | head -n 60 || true)"
+          publish_excerpt 'Flutter/Gradle build errors' "$errors"
+          publish_excerpt 'Flutter/Gradle build log tail' "$(tail -n 80 "$file")"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: writing-questions-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # التحقق البصري الخارجي: يُصيّر ملفَّي النمط الدقيق (Exact) بمحرّكات مستقلة
+  # ويقارن كل صفحة بلقطة المعاينة المقابلة بمقياس RMSE (انظر
+  # tool/verify_visual_parity.sh). مهمة منفصلة حتى لا تُثقل مسار البناء، لكن
+  # فشلها يُظهر التشغيل فاشلاً — فالطابقة البصرية شرط قبول لا إضافة تجميلية.
+  # --------------------------------------------------------------------------
+  visual-parity:
+    name: Visual regression (Exact PDF/DOCX vs preview)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: '3.22.3'
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      # poppler لتصيير PDF، ImageMagick للمقارنة، وLibreOffice لتصيير Word
+      # (ثم يُحوَّل ناتجه إلى PDF بالـpoppler نفسه).
+      - name: Install rendering tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            poppler-utils imagemagick libreoffice-writer
+
+      # ناتج الركيزة يُحفظ ويُنشر عند الفشل: مرفقات CI أنفع عند قراءتها،
+      # وفشل الاختبار يجب أن يظهر سببه لا رقم خروجه فقط.
+      - name: Produce comparison artifacts (preview snapshots + Exact files)
+        shell: bash
+        run: |
+          mkdir -p build/visual_parity
+          set -o pipefail
+          flutter test test/visual/visual_parity_fixture_test.dart 2>&1 \
+            | tee build/visual_parity/fixture_test.log
+
+      - name: Compare rendered files against the preview (RMSE)
+        run: bash tool/verify_visual_parity.sh build/visual_parity
+
+      # سبب الفشل يُنشر كتعليق على التشغيل: سجلات CI قد لا تكون مقروءة من كل
+      # بيئة، والملخّص يجب أن يحمل السبب لا رقم الخروج وحده.
+      - name: Publish visual parity report
+        if: failure()
+        shell: bash
+        run: |
+          annotate() { # <العنوان> <النص>
+            local text="$1"
+            text="${text//%/%25}"
+            text="${text//$'\r'/%0D}"
+            text="${text//$'\n'/%0A}"
+            echo "::error title=$2::$text"
+          }
+
+          report=build/visual_parity/report.txt
+          if [ -f "$report" ]; then
+            annotate "$(tail -n 25 "$report")" "الطابقة البصرية"
+          fi
+
+          log=build/visual_parity/fixture_test.log
+          [ -f "$log" ] || exit 0
+          # (1) مراحل الركيزة: آخر ما وصلت إليه قبل الفشل.
+          stages="$(grep -F '[fixture]' "$log" | tail -n 8 || true)"
+          [ -z "$stages" ] || annotate "$stages" "مسار الركيزة"
+          # (2) رسالة الفشل نفسها (توقّع/استثناء) بأسطرها التالية.
+          failure="$(grep -m 1 -A 14 -F -e '[E]' -e 'Expected:' -e 'Actual:' -e 'Exception' -e 'assertion' "$log" || true)"
+          [ -z "$failure" ] || annotate "$failure" "سبب فشل الركيزة"
+
+      # مقاييس التشغيل تُنشر دائماً (نجاحاً وفشلاً): الرقم هو الدليل، ولا يُترك
+      # في مرفق لا يُقرأ — عند النجاح يظهر في تعليقات التشغيل بلا فتح سجلات.
+      - name: Summarize visual parity measurements
+        if: always()
+        shell: bash
+        run: |
+          file=build/visual_parity/report.txt
+          [ -f "$file" ] || exit 0
+          summary="$(grep -E 'RMSE|البكسلات المضمّنة|النتيجة' "$file" | tail -n 12 || true)"
+          [ -n "$summary" ] || exit 0
+          summary="${summary//%/%25}"
+          summary="${summary//$'\r'/%0D}"
+          summary="${summary//$'\n'/%0A}"
+          echo "::notice title=مقاييس التحقق البصري::$summary"
+
+      - name: Upload visual parity artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: visual-parity
+          path: build/visual_parity
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    name: Attach APK to GitHub release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Pin the runner image to avoid unreviewed toolchain changes from ubuntu-latest.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release APK
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: writing-questions-release-apk
+          path: release-artifact
+
+      - name: Attach APK to GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: release-artifact/app-release.apk
